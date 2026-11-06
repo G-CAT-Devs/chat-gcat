@@ -1,0 +1,24 @@
+# Independent chat1 deployment; does not share chat.gcat.ir's database or volumes.
+name: chat-gcat
+services:
+  webui:
+    image: ${CHAT_IMAGE:?Set CHAT_IMAGE to the built fork image}
+    container_name: chat1-webui
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8089:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - path: .env.production
+        required: true
+    volumes:
+      - chat1_data:/app/backend/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+volumes:
+  chat1_data:

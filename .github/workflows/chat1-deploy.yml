@@ -1,0 +1,107 @@
+name: Chat1 CI and production deployment
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chat1-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check configuration and deployment script
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n deploy/deploy.sh
+          cp .env.production.example .env.production
+          CHAT_IMAGE="ghcr.io/g-cat-devs/chat-gcat@sha256:$(printf 'a%.0s' {1..64})" docker compose -f compose.production.yml config --quiet
+          mkdir -p "$RUNNER_TEMP/nginx/ssl"
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj /CN=localhost \
+            -keyout "$RUNNER_TEMP/nginx/ssl/selfsigned.key" \
+            -out "$RUNNER_TEMP/nginx/ssl/selfsigned.crt"
+          test -s "$RUNNER_TEMP/nginx/ssl/selfsigned.crt"
+          docker run --rm \
+            -v "$PWD/deploy/nginx/chat1.conf:/etc/nginx/conf.d/chat1.conf:ro" \
+            -v "$RUNNER_TEMP/nginx/ssl:/etc/nginx/ssl:ro" \
+            nginx:stable-alpine sh -c 'printf "events {}\nhttp { map \$http_upgrade \$connection_upgrade { default upgrade; \047\047 close; } include /etc/nginx/conf.d/chat1.conf; }\n" > /tmp/nginx.conf; nginx -t -c /tmp/nginx.conf'
+          ! git ls-files --error-unmatch .env.production >/dev/null 2>&1
+
+  build:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish fork image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/g-cat-devs/chat-gcat:main
+          build-args: |
+            BUILD_HASH=${{ github.sha }}
+            BUILD_CHANNEL=main
+          cache-from: type=gha,scope=chat1
+          cache-to: type=gha,mode=max,scope=chat1
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure pinned SSH host and private key
+        env:
+          DEPLOY_KEY: ${{ secrets.CHAT1_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.CHAT1_SSH_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY" && test -n "$KNOWN_HOSTS"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/chat1_deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/chat1_deploy_key ~/.ssh/known_hosts
+      - name: Ship exact deployment configuration and deploy immutable image
+        env:
+          VPS_HOST: ${{ secrets.CHAT1_VPS_HOST }}
+          VPS_USER: ${{ secrets.CHAT1_VPS_USER }}
+          VPS_PORT: ${{ secrets.CHAT1_VPS_PORT }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${VPS_HOST:?Set CHAT1_VPS_HOST}"
+          : "${VPS_USER:?Set CHAT1_VPS_USER}"
+          : "${VPS_PORT:?Set CHAT1_VPS_PORT}"
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          ssh_opts=(-i "$HOME/.ssh/chat1_deploy_key" -p "$VPS_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes)
+          scp -i "$HOME/.ssh/chat1_deploy_key" -P "$VPS_PORT" -o StrictHostKeyChecking=yes compose.production.yml deploy/deploy.sh "$VPS_USER@$VPS_HOST:/opt/chat-gcat/"
+          ssh "${ssh_opts[@]}" "$VPS_USER@$VPS_HOST" "CHAT_IMAGE=ghcr.io/g-cat-devs/chat-gcat@${IMAGE_DIGEST} bash /opt/chat-gcat/deploy.sh"
+          ssh "${ssh_opts[@]}" "$VPS_USER@$VPS_HOST" 'curl --fail --silent --show-error --max-time 10 -H "Host: chat1.gcat.ir" https://127.0.0.1/health -k >/dev/null && curl --fail --silent --show-error --max-time 10 -H "Host: chat.1.g-cat.ir" https://127.0.0.1/health -k >/dev/null'
